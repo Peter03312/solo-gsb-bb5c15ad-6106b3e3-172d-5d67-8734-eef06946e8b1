@@ -1797,6 +1797,274 @@ class DeliveryApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/isolation/events").json(), [])
 
 
+# 等级保障核算请求样例（基于 VALID_NETWORK）
+def _priority_body(version=1, *, source_cap=100, pipe_caps=None, demands=None):
+    return {
+        "version": version,
+        "sources": [{"source_id": "S", "capacity": source_cap}],
+        "pipes": [
+            {"pipe_id": pid, "capacity": cap}
+            for pid, cap in (
+                pipe_caps
+                or [("P1", 100), ("P2", 100), ("P3", 100),
+                    ("P4", 100), ("P5", 100), ("P6", 100)]
+            )
+        ],
+        "demands": [
+            {"sink_id": sid, "demand": d, "level": lvl}
+            for sid, d, lvl in (
+                demands
+                if demands is not None
+                else [("U1", 10, 1), ("U2", 10, 2), ("U3", 10, 2)]
+            )
+        ],
+    }
+
+
+class PriorityDeliveryApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        STORE.version = 0
+        STORE.nodes = {}
+        STORE.pipes = {}
+        STORE.events = []
+        STORE.next_event_id = 1
+        STORE.snapshots = []
+        STORE.next_snapshot_id = 1
+        STORE.fail_commit = False
+
+    def _import(self, network=VALID_NETWORK):
+        r = self.client.post("/api/network/import", json=network)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def test_all_satisfied_when_capacity_abundant(self):
+        self._import()
+        r = self.client.post("/api/delivery/priority", json=_priority_body())
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(
+            r.json(),
+            {
+                "version": 1,
+                "version_match": True,
+                "total_demand": 30,
+                "delivered_total": 30,
+                "all_satisfied": True,
+                "deliveries": [
+                    {"sink_id": "U1", "level": 1, "demand": 10,
+                     "delivered": 10, "shortfall": 0},
+                    {"sink_id": "U2", "level": 2, "demand": 10,
+                     "delivered": 10, "shortfall": 0},
+                    {"sink_id": "U3", "level": 2, "demand": 10,
+                     "delivered": 10, "shortfall": 0},
+                ],
+            },
+        )
+
+    def test_level_priority_when_supply_short(self):
+        self._import()
+        # 水源只能供 25：等级 1 的 U1 全额 10；等级 2 合计 15，按编号 U2 先最大化
+        r = self.client.post(
+            "/api/delivery/priority", json=_priority_body(source_cap=25)
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["delivered_total"], 25)
+        self.assertFalse(out["all_satisfied"])
+        delivered = {d["sink_id"]: d["delivered"] for d in out["deliveries"]}
+        self.assertEqual(delivered, {"U1": 10, "U2": 10, "U3": 5})
+        shortfall = {d["sink_id"]: d["shortfall"] for d in out["deliveries"]}
+        self.assertEqual(shortfall, {"U1": 0, "U2": 0, "U3": 5})
+
+    def test_level_total_maximized_before_individual(self):
+        self._import()
+        # 水源供 15：等级 1 总量 15（U1+U2），等级 2 不得；同级内 U1 编号靠前先最大
+        r = self.client.post(
+            "/api/delivery/priority",
+            json=_priority_body(
+                source_cap=15,
+                demands=[("U1", 10, 1), ("U2", 10, 1), ("U3", 10, 2)],
+            ),
+        )
+        out = r.json()
+        delivered = {d["sink_id"]: d["delivered"] for d in out["deliveries"]}
+        self.assertEqual(delivered, {"U1": 10, "U2": 5, "U3": 0})
+
+    def test_pipe_bottleneck_caps_delivery(self):
+        self._import()
+        # P3 是 U1 的唯一通道，只能过 6
+        r = self.client.post(
+            "/api/delivery/priority",
+            json=_priority_body(
+                pipe_caps=[("P1", 100), ("P2", 100), ("P3", 6),
+                           ("P4", 100), ("P5", 100), ("P6", 100)],
+                demands=[("U1", 10, 1), ("U2", 10, 1)],
+            ),
+        )
+        out = r.json()
+        delivered = {d["sink_id"]: d["delivered"] for d in out["deliveries"]}
+        self.assertEqual(delivered, {"U1": 6, "U2": 10})
+        self.assertFalse(out["all_satisfied"])
+
+    def test_closed_valve_and_open_fault_block(self):
+        self._import()
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post(
+            "/api/delivery/priority",
+            json=_priority_body(version=2, demands=[("U1", 10, 1), ("U3", 10, 1)]),
+        )
+        out = r.json()
+        delivered = {d["sink_id"]: d["delivered"] for d in out["deliveries"]}
+        # P6 待修复 + P4 关闭：U3 断供
+        self.assertEqual(delivered, {"U1": 10, "U3": 0})
+
+    def test_stale_version_still_evaluated_against_current(self):
+        self._import()
+        r = self.client.post(
+            "/api/delivery/priority", json=_priority_body(version=42)
+        )
+        self.assertEqual(r.status_code, 200)
+        out = r.json()
+        self.assertEqual(out["version"], 1)
+        self.assertFalse(out["version_match"])
+        self.assertTrue(out["all_satisfied"])
+
+    def test_unlisted_sink_not_in_result(self):
+        self._import()
+        r = self.client.post(
+            "/api/delivery/priority",
+            json=_priority_body(demands=[("U3", 5, 1)]),
+        )
+        out = r.json()
+        self.assertEqual([d["sink_id"] for d in out["deliveries"]], ["U3"])
+        self.assertTrue(out["all_satisfied"])
+
+    def test_empty_network_coverage(self):
+        # 空网（版本 0）：用水点不可能存在 -> 422
+        body = {
+            "version": 0,
+            "sources": [],
+            "pipes": [],
+            "demands": [{"sink_id": "U1", "demand": 1, "level": 1}],
+        }
+        r = self.client.post("/api/delivery/priority", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "DELIVERY_PRIORITY_INVALID")
+        self.assertEqual(
+            r.json()["error"]["issues"][0]["code"], "DELIVERY_SINK_NOT_FOUND"
+        )
+
+    def test_missing_source_and_pipe_rejected(self):
+        self._import()
+        body = _priority_body()
+        body["sources"] = []
+        body["pipes"] = [p for p in body["pipes"] if p["pipe_id"] != "P6"]
+        r = self.client.post("/api/delivery/priority", json=body)
+        self.assertEqual(r.status_code, 422)
+        err = r.json()["error"]
+        self.assertEqual(err["code"], "DELIVERY_PRIORITY_INVALID")
+        codes = {i["code"] for i in err["issues"]}
+        self.assertEqual(codes, {"DELIVERY_SOURCE_MISSING", "DELIVERY_PIPE_MISSING"})
+
+    def test_unknown_and_duplicate_ids_rejected(self):
+        self._import()
+        body = _priority_body()
+        body["sources"].append({"source_id": "S", "capacity": 1})
+        body["sources"].append({"source_id": "SX", "capacity": 1})
+        body["pipes"].append({"pipe_id": "P1", "capacity": 1})
+        body["pipes"].append({"pipe_id": "PX", "capacity": 1})
+        body["demands"].append({"sink_id": "U1", "demand": 1, "level": 1})
+        body["demands"].append({"sink_id": "S", "demand": 1, "level": 1})
+        body["demands"].append({"sink_id": "UX", "demand": 1, "level": 1})
+        r = self.client.post("/api/delivery/priority", json=body)
+        self.assertEqual(r.status_code, 422)
+        codes = {i["code"] for i in r.json()["error"]["issues"]}
+        self.assertEqual(
+            codes,
+            {
+                "DELIVERY_SOURCE_DUPLICATE",
+                "DELIVERY_SOURCE_NOT_FOUND",
+                "DELIVERY_PIPE_DUPLICATE",
+                "DELIVERY_PIPE_NOT_FOUND",
+                "DELIVERY_SINK_DUPLICATE",
+                "DELIVERY_SINK_NOT_SINK",
+                "DELIVERY_SINK_NOT_FOUND",
+            },
+        )
+
+    def test_empty_demands_rejected(self):
+        self._import()
+        body = _priority_body()
+        body["demands"] = []
+        r = self.client.post("/api/delivery/priority", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(
+            r.json()["error"]["issues"][0]["code"], "DELIVERY_DEMANDS_EMPTY"
+        )
+
+    def test_non_integer_and_bad_level_values_rejected(self):
+        self._import()
+
+        def post_raw(raw):
+            return self.client.post(
+                "/api/delivery/priority",
+                content=json.dumps(raw),
+                headers={"Content-Type": "application/json"},
+            )
+
+        base = _priority_body()
+        # 等级必须为正整数：0 / 负数 / 小数 / 布尔均拒绝
+        for bad_level in (0, -1, 1.5, True):
+            bad = json.loads(json.dumps(base))
+            bad["demands"][0]["level"] = bad_level
+            self.assertEqual(post_raw(bad).status_code, 422, bad_level)
+        # 布尔容量
+        bad = json.loads(json.dumps(base))
+        bad["sources"][0]["capacity"] = True
+        self.assertEqual(post_raw(bad).status_code, 422)
+        # 负需求
+        bad = json.loads(json.dumps(base))
+        bad["demands"][0]["demand"] = -3
+        self.assertEqual(post_raw(bad).status_code, 422)
+        # 小数管段容量
+        bad = json.loads(json.dumps(base))
+        bad["pipes"][0]["capacity"] = 1.5
+        self.assertEqual(post_raw(bad).status_code, 422)
+        # 字符串版本号不自动转型
+        bad = json.loads(json.dumps(base))
+        bad["version"] = "1"
+        self.assertEqual(post_raw(bad).status_code, 422)
+        # 额外字段
+        bad = json.loads(json.dumps(base))
+        bad["demands"][0]["extra"] = 1
+        self.assertEqual(post_raw(bad).status_code, 422)
+
+    def test_read_only_no_version_valve_or_snapshot_change(self):
+        info = self._import()
+        snapshot_after_import = info["snapshot_id"]
+        self.client.post("/api/delivery/priority", json=_priority_body())
+        self.client.post("/api/delivery/priority", json=_priority_body(version=99))
+        bad = _priority_body()
+        bad["sources"] = []
+        self.client.post("/api/delivery/priority", json=bad)
+
+        net = self.client.get("/api/network").json()
+        self.assertEqual(net["version"], 1)
+        snap = self.client.get("/api/snapshots").json()
+        self.assertEqual([s["id"] for s in snap], [snapshot_after_import])
+        self.assertTrue(
+            all(p["valve_closed"] is False for p in net["pipes"] if p["has_valve"])
+        )
+        self.assertEqual(self.client.get("/api/isolation/events").json(), [])
+
+
 def _reconcile_body(
     version=1,
     *,

@@ -124,6 +124,39 @@ class DeliveryEvaluateIn(BaseModel):
     )
 
 
+class PriorityDemandIn(BaseModel):
+    """单个用水点的需求与保障等级（等级数字越小越优先；未列出的用水点按零需求）。"""
+
+    sink_id: str = Field(min_length=1, description="用水点节点编号")
+    demand: StrictInt = Field(ge=0, description="流量需求（非负整数，升/小时）")
+    level: StrictInt = Field(
+        ge=1, description="保障等级（正整数，数字越小越优先）"
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class DeliveryPriorityIn(BaseModel):
+    """等级保障核算入参：已读版本 + 每个水源供水上限 + 每条管段双向共用上限
+    + 非空用水点需求（含保障等级）。
+
+    水源与管段编号须完整覆盖当前管网（不多不少、同类不重复）；
+    用水点编号须存在且为 sink、同批不得重复；需求列表非空（允许单点需求为 0）。
+    """
+
+    version: StrictInt = Field(ge=0, description="读取管网时的版本号，空网为 0")
+    sources: list[DeliverySourceIn] = Field(
+        description="每个水源的供水上限（须覆盖当前管网全部水源；空网为空列表）"
+    )
+    pipes: list[DeliveryPipeIn] = Field(
+        description="每条管段的双向共用输水上限（须覆盖全部管段；空网为空列表）"
+    )
+    demands: list[PriorityDemandIn] = Field(
+        description="非空用水点需求列表（含保障等级；未列需求的用水点按零需求）；"
+        "为空时由领域校验统一返回 DELIVERY_DEMANDS_EMPTY"
+    )
+
+
 # ---------------------------------------------------------------- 响应模型
 
 
@@ -271,6 +304,27 @@ class DeliveryEvaluateOut(BaseModel):
     total_demand: int
     max_delivered_total: int
     feasible: bool
+
+
+class PriorityDeliveryItemOut(BaseModel):
+    """单个用水点的等级保障核算结果：交付不超过需求，缺口 = 需求 - 交付。"""
+
+    sink_id: str
+    level: int
+    demand: int
+    delivered: int
+    shortfall: int
+
+
+class DeliveryPriorityOut(BaseModel):
+    """等级保障核算只读结果：当前版本/版本是否匹配/需求与交付总量/逐点交付与缺口/是否全部满足。"""
+
+    version: int
+    version_match: bool
+    total_demand: int
+    delivered_total: int
+    all_satisfied: bool
+    deliveries: list[PriorityDeliveryItemOut]
 
 
 class ReconcileSourceIn(BaseModel):

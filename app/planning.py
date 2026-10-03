@@ -54,6 +54,18 @@
   consistent=false 且不输出补值。
 - 注入、取用、容量均为非负整数；编号覆盖不足/重复/未知节点/非整数或负容量
   整体拒绝（422）；版本过期仍按当前状态计算，仅标记 version_match=false。
+
+等级保障流量核算（delivery priority）规则（只读，不改阀位/事件/版本/快照）：
+- 供水不足时，调度员按保障等级核算各用水点可获得的流量：入参与流量核算
+  一致（已读版本 + 覆盖全部水源/管段的非负整数容量 + 非空用水点需求），
+  并为每个申报需求附加正整数保障等级（数字越小越优先）；未列用水点按零需求。
+- 通水口径与流量核算完全一致：停运水源不供水、已关闭阀门与待修复故障管段
+  不可通行、管段容量双向共用（无向边建模）、各点交付不得超过需求。
+- 目标（词典序）：先按等级升序依次最大化该等级交付总量，再在各等级总量
+  最优条件下按（等级、用水点编号）顺序逐点最大化交付量。
+- 实现为顺序锁定（Megiddo）：每一步在当前下界约束下求一条目标弧的最大
+  流量（下界可行流 + 残量补偿流），求出即锁为后续步骤的下界；最后一步的
+  可行流同时实现全部交付量，故结果必可由一组同时可行的整数流量实现。
 """
 from __future__ import annotations
 
@@ -1558,6 +1570,189 @@ def reconcile_meters(
         )
 
     return ReconcileResult(consistent=True, readings=ranges, reasons=[])
+
+
+# ---------------------------------------------------------------- 等级保障流量核算
+
+
+@dataclass
+class PriorityDeliveryItem:
+    """单个用水点的等级保障核算结果（交付不超过需求，缺口 = 需求 - 交付）。"""
+
+    sink_id: str
+    level: int
+    demand: int
+    delivered: int
+    shortfall: int
+
+
+@dataclass
+class PriorityDeliveryResult:
+    """按保障等级核算各用水点可获流量（只读计算，不改任何状态）。
+
+    - deliveries：按 (等级, 用水点编号) 排序的逐点交付与缺口；
+    - total_demand / delivered_total：申报需求总量 / 可交付总量；
+    - all_satisfied：全部申报需求均可满足（delivered_total == total_demand）。
+    """
+
+    total_demand: int
+    delivered_total: int
+    all_satisfied: bool
+    deliveries: list[PriorityDeliveryItem] = field(default_factory=list)
+
+
+def _max_arc_flow_with_lower_bounds(
+    n: int, arcs: list[tuple[int, int, int, int]], obj: int
+) -> int:
+    """带下界有向弧网络中，arcs[obj] 在全部可行整数流里的最大流量。
+
+    arcs：(u, v, low, high)，0 <= low <= high，全部整数。
+    第一步：下界 -> 节点平衡变换，加超级源/汇求一组可行整数流
+    （下界均来自此前步骤已实现的交付量，按构造必然可行）；
+    第二步：在残量网中剔除目标弧两个方向，求 v->u 最大补偿流，
+    目标弧最大流量 = 当前流量 + min(目标弧正向残量, 补偿流)
+    （残量环流定理，与缺报读数范围计算同理）。
+    """
+    ss, tt = n, n + 1
+    dinic = _Dinic(n + 2)
+    balances = [0] * n
+    refs: list[tuple[int, int]] = []
+    for u, v, low, high in arcs:
+        edge_idx = dinic.add_arc(u, v, high - low)
+        refs.append((u, edge_idx))
+        balances[u] -= low
+        balances[v] += low
+
+    required = 0
+    for v in range(n):
+        need = balances[v]
+        if need > 0:
+            dinic.add_arc(ss, v, need)
+            required += need
+        elif need < 0:
+            dinic.add_arc(v, tt, -need)
+
+    flowed = dinic.max_flow(ss, tt)
+    # 下界来自已实现的交付量，可行流必然存在（与 reconcile 的断言同理）
+    assert flowed == required, (flowed, required)
+
+    u, v, low, _high = arcs[obj]
+    eu, edge_idx = refs[obj]
+    edge = dinic.graph[eu][edge_idx]
+    current = low + edge[4]
+    room = edge[1]
+    back = dinic.graph[v][edge[2]]
+    # 剔除目标弧自身两个方向的残量后，补偿流即该弧可再增大的量
+    edge[1] = 0
+    back[1] = 0
+    gain = dinic.max_flow(v, u)
+    return current + min(room, gain)
+
+
+def evaluate_priority_delivery(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    source_caps: list[tuple[str, int]],
+    pipe_caps: list[tuple[str, int]],
+    demands: list[tuple[str, int, int]],
+    *,
+    blocked_pipe_ids: frozenset[str] = frozenset(),
+) -> PriorityDeliveryResult:
+    """按保障等级核算各用水点可获得的流量（只读）。
+
+    demands：(用水点编号, 需求, 等级)；等级为正整数、数字越小越优先；
+    未列出的用水点按零需求（不消耗流量）。通水口径与 evaluate_delivery
+    完全一致：停运水源不供水（容量按 0）；已关闭阀门与待修复故障管段
+    不可通行（容量按 0）；管段双向共用容量按无向边建模；各点交付不超过
+    需求。调用方须先通过 validate_delivery_request 结构校验。
+
+    目标（词典序）：先按等级升序依次最大化该等级交付总量，再在各等级
+    总量最优条件下按 (等级, 用水点编号) 顺序逐点最大化交付量。
+    实现为顺序锁定：每一步在当前下界约束下求一条目标弧的最大流量，
+    求出即锁为后续步骤的下界；最后一步的可行流同时实现全部交付量，
+    故结果必可由一组同时可行的整数流量实现。
+    """
+    node_ids = list(nodes.keys())
+    index = {nid: i for i, nid in enumerate(node_ids)}
+    levels = sorted({level for _sid, _d, level in demands})
+    level_node = {lvl: len(node_ids) + k for k, lvl in enumerate(levels)}
+    super_source = len(node_ids) + len(levels)
+    super_sink = super_source + 1
+    n = super_sink + 1
+
+    source_cap_map = dict(source_caps)
+    pipe_cap_map = dict(pipe_caps)
+    # 闭合弧（超级汇 -> 超级源）容量：超过任何可行总流量即可
+    total_bound = sum(source_cap_map.values()) + sum(d for _s, d, _l in demands) + 1
+
+    arcs: list[list[int]] = []  # [u, v, low, high]，low 随顺序锁定逐步收紧
+    # 闭合弧：下界可行流的回流边（承载总交付）
+    arcs.append([super_sink, super_source, 0, total_bound])
+    # 超级源 -> 各水源（停运水源容量按 0，不供水）
+    for nid, node in nodes.items():
+        if node.type == "source":
+            cap = source_cap_map[nid] if node.running else 0
+            arcs.append([super_source, index[nid], 0, cap])
+    # 管段：无向双向共用容量 -> 两条对向有向弧（与 _undirected_max_flow 同口径）
+    for p in pipes.values():
+        cap = 0 if p.id in blocked_pipe_ids else pipe_cap_map[p.id]
+        u, v = index[p.from_node], index[p.to_node]
+        arcs.append([u, v, 0, cap])
+        arcs.append([v, u, 0, cap])
+    # 用水点 -> 等级节点（容量 = 需求，交付不超过需求）
+    sink_arc: dict[str, int] = {}
+    for sid, demand, lvl in demands:
+        sink_arc[sid] = len(arcs)
+        arcs.append([index[sid], level_node[lvl], 0, demand])
+    # 等级节点 -> 超级汇（容量 = 该等级需求总量）
+    level_arc: dict[int, int] = {}
+    for lvl in levels:
+        level_arc[lvl] = len(arcs)
+        arcs.append(
+            [
+                level_node[lvl],
+                super_sink,
+                0,
+                sum(d for _s, d, l in demands if l == lvl),
+            ]
+        )
+
+    def current_arcs() -> list[tuple[int, int, int, int]]:
+        return [(u, v, low, high) for u, v, low, high in arcs]
+
+    # 阶段一：按等级升序，依次最大化该等级交付总量并锁死为后续下界
+    for lvl in levels:
+        a = level_arc[lvl]
+        total = _max_arc_flow_with_lower_bounds(n, current_arcs(), a)
+        arcs[a][2] = arcs[a][3] = total
+
+    # 阶段二：各等级总量已最优，按 (等级, 用水点编号) 逐点最大化并锁死
+    delivered: dict[str, int] = {}
+    ordered = sorted(demands, key=lambda item: (item[2], item[0]))
+    for sid, _demand, _lvl in ordered:
+        a = sink_arc[sid]
+        amount = _max_arc_flow_with_lower_bounds(n, current_arcs(), a)
+        arcs[a][2] = arcs[a][3] = amount
+        delivered[sid] = amount
+
+    items = [
+        PriorityDeliveryItem(
+            sink_id=sid,
+            level=lvl,
+            demand=demand,
+            delivered=delivered[sid],
+            shortfall=demand - delivered[sid],
+        )
+        for sid, demand, lvl in ordered
+    ]
+    total_demand = sum(d for _s, d, _l in demands)
+    delivered_total = sum(delivered.values())
+    return PriorityDeliveryResult(
+        total_demand=total_demand,
+        delivered_total=delivered_total,
+        all_satisfied=delivered_total == total_demand,
+        deliveries=items,
+    )
 
 
 # ---------------------------------------------------------------- 状态快照

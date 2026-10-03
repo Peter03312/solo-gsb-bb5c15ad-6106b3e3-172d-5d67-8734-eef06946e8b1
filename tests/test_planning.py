@@ -14,6 +14,7 @@ from app.planning import (  # noqa: E402
     diff_states,
     evaluate_delivery,
     evaluate_plan,
+    evaluate_priority_delivery,
     evaluate_restore,
     evaluate_source_switch,
     freeze_state,
@@ -1251,6 +1252,313 @@ class ReconcileMetersTests(unittest.TestCase):
         result = reconcile_meters({}, {}, [], [], [])
         self.assertTrue(result.consistent)
         self.assertEqual(result.readings, [])
+
+
+# ---------------------------------------------------------------- 等级保障流量核算
+
+
+def build_priority_demo():
+    """单水源分支管网（便于手算等级分配）：
+
+    S --P1-- X --P2-- UA
+             |
+             P3
+             |
+             UB
+    """
+    nodes = {
+        "S": Node("S", "source"),
+        "X": Node("X", "junction"),
+        "UA": Node("UA", "sink"),
+        "UB": Node("UB", "sink"),
+    }
+    pipes = {
+        "P1": Pipe("P1", "S", "X"),
+        "P2": Pipe("P2", "X", "UA"),
+        "P3": Pipe("P3", "X", "UB"),
+    }
+    return nodes, pipes
+
+
+class PriorityDeliveryTests(unittest.TestCase):
+    def _deliveries(self, result):
+        return {item.sink_id: item.delivered for item in result.deliveries}
+
+    def test_level_priority_shared_bottleneck(self):
+        # 水源只能供 10：等级 1 的 UB 先全额满足，等级 2 的 UA 不得
+        nodes, pipes = build_priority_demo()
+        result = evaluate_priority_delivery(
+            nodes, pipes,
+            [("S", 10)],
+            [("P1", 100), ("P2", 100), ("P3", 100)],
+            [("UA", 10, 2), ("UB", 10, 1)],
+        )
+        self.assertEqual(self._deliveries(result), {"UA": 0, "UB": 10})
+        self.assertEqual(result.total_demand, 20)
+        self.assertEqual(result.delivered_total, 10)
+        self.assertFalse(result.all_satisfied)
+        # 缺口 = 需求 - 交付
+        shortfalls = {item.sink_id: item.shortfall for item in result.deliveries}
+        self.assertEqual(shortfalls, {"UA": 10, "UB": 0})
+
+    def test_level_total_maximized_across_sinks(self):
+        # 等级 1 两点合计最多 10（P1 瓶颈），等级 2 不得；同级内再按编号逐点最大
+        nodes, pipes = build_priority_demo()
+        result = evaluate_priority_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 10), ("P2", 100), ("P3", 100)],
+            [("UA", 8, 1), ("UB", 8, 1)],
+        )
+        # 等级总量 10；UA 编号靠前逐点最大化得 8，UB 得余量 2
+        self.assertEqual(self._deliveries(result), {"UA": 8, "UB": 2})
+        self.assertEqual(result.delivered_total, 10)
+
+    def test_within_level_lexicographic_by_sink_id(self):
+        # UA 通道细（4）、UB 通道粗（10）：等级总量 10，UA 逐点最大只能 4，UB 得 6
+        nodes, pipes = build_priority_demo()
+        result = evaluate_priority_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 10), ("P2", 4), ("P3", 10)],
+            [("UA", 10, 1), ("UB", 10, 1)],
+        )
+        self.assertEqual(self._deliveries(result), {"UA": 4, "UB": 6})
+        # 对调通道：UA 逐点最大为 10，UB 为 0
+        result = evaluate_priority_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 10), ("P2", 10), ("P3", 4)],
+            [("UA", 10, 1), ("UB", 10, 1)],
+        )
+        self.assertEqual(self._deliveries(result), {"UA": 10, "UB": 0})
+
+    def test_delivery_capped_by_demand(self):
+        nodes, pipes = build_priority_demo()
+        result = evaluate_priority_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 100), ("P2", 100), ("P3", 100)],
+            [("UA", 3, 1), ("UB", 4, 2)],
+        )
+        self.assertEqual(self._deliveries(result), {"UA": 3, "UB": 4})
+        self.assertTrue(result.all_satisfied)
+        self.assertEqual(result.delivered_total, 7)
+
+    def test_three_levels_ordered(self):
+        # 三级共享水源 7：等级 1 得 4、等级 2 得 3、等级 3 得 0
+        nodes = {
+            "S": Node("S", "source"),
+            "U1": Node("U1", "sink"),
+            "U2": Node("U2", "sink"),
+            "U3": Node("U3", "sink"),
+        }
+        pipes = {
+            "P1": Pipe("P1", "S", "U1"),
+            "P2": Pipe("P2", "S", "U2"),
+            "P3": Pipe("P3", "S", "U3"),
+        }
+        result = evaluate_priority_delivery(
+            nodes, pipes,
+            [("S", 7)],
+            [("P1", 4), ("P2", 4), ("P3", 4)],
+            [("U1", 4, 3), ("U2", 4, 1), ("U3", 4, 2)],
+        )
+        self.assertEqual(
+            self._deliveries(result), {"U1": 0, "U2": 4, "U3": 3}
+        )
+
+    def test_stopped_source_and_blocked_pipes(self):
+        # 停运水源不供水；关阀/待修复故障管段不可通行
+        nodes = {
+            "S1": Node("S1", "source", running=False),
+            "S2": Node("S2", "source"),
+            "C": Node("C", "junction"),
+            "U1": Node("U1", "sink"),
+            "U2": Node("U2", "sink"),
+        }
+        pipes = {
+            "Q1": Pipe("Q1", "S1", "C"),
+            "Q3": Pipe("Q3", "S2", "C"),
+            "Q2": Pipe("Q2", "C", "U1", has_valve=True, valve_closed=True),
+            "Q4": Pipe("Q4", "C", "U2"),
+        }
+        result = evaluate_priority_delivery(
+            nodes, pipes,
+            [("S1", 100), ("S2", 100)],
+            [("Q1", 100), ("Q3", 5), ("Q2", 100), ("Q4", 100)],
+            [("U1", 10, 1), ("U2", 10, 2)],
+            blocked_pipe_ids=frozenset({"Q2"}),
+        )
+        # S1 停运、Q2 关闭：U1 断供；U2 受 Q3=5 限制
+        self.assertEqual(self._deliveries(result), {"U1": 0, "U2": 5})
+        self.assertFalse(result.all_satisfied)
+
+    def test_unlisted_sink_not_in_result(self):
+        # 未列用水点按零需求：不出现在结果中，也不消耗交付额度
+        nodes, pipes = build_priority_demo()
+        result = evaluate_priority_delivery(
+            nodes, pipes,
+            [("S", 5)],
+            [("P1", 100), ("P2", 100), ("P3", 100)],
+            [("UA", 10, 1)],
+        )
+        self.assertEqual([item.sink_id for item in result.deliveries], ["UA"])
+        self.assertEqual(self._deliveries(result), {"UA": 5})
+
+    def test_zero_demand_entry(self):
+        nodes, pipes = build_priority_demo()
+        result = evaluate_priority_delivery(
+            nodes, pipes,
+            [("S", 10)],
+            [("P1", 100), ("P2", 100), ("P3", 100)],
+            [("UA", 0, 1), ("UB", 10, 1)],
+        )
+        self.assertEqual(self._deliveries(result), {"UA": 0, "UB": 10})
+        self.assertTrue(result.all_satisfied)
+
+    def test_result_sorted_by_level_then_sink_id(self):
+        nodes, pipes = build_priority_demo()
+        result = evaluate_priority_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 100), ("P2", 100), ("P3", 100)],
+            [("UB", 1, 2), ("UA", 1, 1)],  # 请求顺序打乱
+        )
+        self.assertEqual(
+            [(item.sink_id, item.level) for item in result.deliveries],
+            [("UA", 1), ("UB", 2)],
+        )
+
+    def test_deliveries_simultaneously_realizable(self):
+        # 结果必须可由一组同时可行的整数流量实现：把各点交付量作为汇边上限，
+        # 用既有整数最大流独立复核总交付量可达
+        nodes = {
+            "S1": Node("S1", "source"),
+            "S2": Node("S2", "source"),
+            "C": Node("C", "junction"),
+            "U1": Node("U1", "sink"),
+            "U2": Node("U2", "sink"),
+            "U3": Node("U3", "sink"),
+        }
+        pipes = {
+            "Q1": Pipe("Q1", "S1", "C"),
+            "Q2": Pipe("Q2", "S2", "C"),
+            "Q3": Pipe("Q3", "C", "U1"),
+            "Q4": Pipe("Q4", "C", "U2"),
+            "Q5": Pipe("Q5", "S2", "U3"),
+        }
+        source_caps = [("S1", 6), ("S2", 6)]
+        pipe_caps = [("Q1", 6), ("Q2", 6), ("Q3", 5), ("Q4", 5), ("Q5", 4)]
+        demands = [("U1", 5, 1), ("U2", 5, 2), ("U3", 4, 2)]
+        result = evaluate_priority_delivery(
+            nodes, pipes, source_caps, pipe_caps, demands
+        )
+        delivered = self._deliveries(result)
+        # 独立复核：以交付量为汇边上限跑既有最大流，总量必须全部同时可达
+        flow = _undirected_max_flow(
+            list(nodes.keys()),
+            [(p.from_node, p.to_node, c) for p, (_pid, c) in zip(pipes.values(), pipe_caps)],
+            source_caps,
+            [(sid, d) for sid, d in delivered.items()],
+        )
+        self.assertEqual(flow, result.delivered_total)
+        # 各等级总量：等级 1 优先（U1 得 5），等级 2 共享余量
+        self.assertEqual(delivered["U1"], 5)
+        self.assertEqual(delivered["U2"] + delivered["U3"], result.delivered_total - 5)
+
+    def test_brute_force_random_small_networks(self):
+        # 与指数级暴力枚举对拍：随机小网上两阶段词典序结果必须一致
+        import random
+        from itertools import product
+
+        def brute(node_ids, edges, sources, demands):
+            demand_map = {sid: d for sid, d, _l in demands}
+            level_map = {sid: l for sid, _d, l in demands}
+            src_map = dict(sources)
+            junctions = [
+                n for n in node_ids if n not in src_map and n not in demand_map
+            ]
+            best = None
+            for combo in product(*[range(-c, c + 1) for _u, _v, c in edges]):
+                net = {nid: 0 for nid in node_ids}
+                for (u, v, _c), f in zip(edges, combo):
+                    net[u] -= f
+                    net[v] += f
+                ok = True
+                for nid, cap in sources:
+                    if not 0 <= -net[nid] <= cap:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                for nid in junctions:
+                    if net[nid] != 0:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                delivery = {}
+                for sid, d in demand_map.items():
+                    if not 0 <= net[sid] <= d:
+                        ok = False
+                        break
+                    delivery[sid] = net[sid]
+                if not ok:
+                    continue
+                key = [
+                    sum(
+                        delivery[s]
+                        for s in demand_map
+                        if level_map[s] == lvl
+                    )
+                    for lvl in sorted(set(level_map.values()))
+                ]
+                key += [
+                    delivery[sid]
+                    for sid, _d, _l in sorted(
+                        demands, key=lambda x: (x[2], x[0])
+                    )
+                ]
+                if best is None or key > best[0]:
+                    best = (key, delivery)
+            return best[1]
+
+        rng = random.Random(20261003)
+        for trial in range(15):
+            n_j = rng.randint(0, 2)
+            node_ids = ["S"] + [f"J{i}" for i in range(n_j)] + ["U1", "U2", "U3"]
+            nodes = {"S": Node("S", "source")}
+            nodes.update({f"J{i}": Node(f"J{i}", "junction") for i in range(n_j)})
+            nodes.update({u: Node(u, "sink") for u in ("U1", "U2", "U3")})
+            candidates = [
+                (a, b)
+                for i, a in enumerate(node_ids)
+                for b in node_ids[i + 1:]
+            ]
+            rng.shuffle(candidates)
+            edges = [
+                (a, b, rng.randint(0, 2))
+                for a, b in candidates[: rng.randint(3, 5)]
+            ]
+            pipes = {
+                f"E{k}": Pipe(f"E{k}", a, b) for k, (a, b, _c) in enumerate(edges)
+            }
+            pipe_caps = [(f"E{k}", c) for k, (_a, _b, c) in enumerate(edges)]
+            source_caps = [("S", rng.randint(0, 4))]
+            demands = [
+                (u, rng.randint(0, 3), rng.randint(1, 3))
+                for u in ("U1", "U2", "U3")
+            ]
+            result = evaluate_priority_delivery(
+                nodes, pipes, source_caps, pipe_caps, demands
+            )
+            expected = brute(node_ids, edges, source_caps, demands)
+            self.assertEqual(
+                self._deliveries(result),
+                expected,
+                f"random#{trial}: edges={edges} sources={source_caps} demands={demands}",
+            )
 
 
 if __name__ == "__main__":

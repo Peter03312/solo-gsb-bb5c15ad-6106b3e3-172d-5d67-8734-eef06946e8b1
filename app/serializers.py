@@ -7,6 +7,7 @@ from .planning import (
     RestoreResult,
     SourceSwitchResult,
     DeliveryResult,
+    PriorityDeliveryResult,
     ReconcileResult,
 )
 
@@ -120,6 +121,30 @@ def serialize_delivery(
         "total_demand": result.total_demand,
         "max_delivered_total": result.max_delivered_total,
         "feasible": result.feasible,
+    }
+
+
+def serialize_priority_delivery(
+    version: int,
+    expected_version: int,
+    result: PriorityDeliveryResult,
+) -> dict:
+    return {
+        "version": version,
+        "version_match": version == expected_version,
+        "total_demand": result.total_demand,
+        "delivered_total": result.delivered_total,
+        "all_satisfied": result.all_satisfied,
+        "deliveries": [
+            {
+                "sink_id": item.sink_id,
+                "level": item.level,
+                "demand": item.demand,
+                "delivered": item.delivered,
+                "shortfall": item.shortfall,
+            }
+            for item in result.deliveries
+        ],
     }
 
 

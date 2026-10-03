@@ -13,6 +13,7 @@
 - POST /api/sources/switch/preview                     水源停运/恢复预演（只读）
 - POST /api/sources/switch                             水源停运/恢复确认（单事务复核 + 原子改状态）
 - POST /api/delivery/evaluate                          用水点最低流量核算（只读：现有阀位/故障下最大可交付总量）
+- POST /api/delivery/priority                          按保障等级核算各用水点可获流量（只读：先等级总量、再逐点词典序最大）
 - POST /api/meters/reconcile                           管段流量计读数核对（只读：一致性 + 缺报读数可行流量范围）
 
 状态回看（快照）：
@@ -33,6 +34,7 @@ from .planning import (
     diff_states,
     evaluate_delivery,
     evaluate_plan,
+    evaluate_priority_delivery,
     evaluate_restore,
     evaluate_source_switch,
     recommend_plan,
@@ -49,6 +51,7 @@ from .schemas import (
     RestoreIn,
     SourceSwitchIn,
     DeliveryEvaluateIn,
+    DeliveryPriorityIn,
     MeterReconcileIn,
     ImportOut,
     NetworkOut,
@@ -60,6 +63,7 @@ from .schemas import (
     SourceSwitchPreviewOut,
     SourceSwitchOut,
     DeliveryEvaluateOut,
+    DeliveryPriorityOut,
     MeterReconcileOut,
     EventOut,
     SnapshotOut,
@@ -72,6 +76,7 @@ from .serializers import (
     serialize_restore_preview,
     serialize_source_switch_preview,
     serialize_delivery,
+    serialize_priority_delivery,
     serialize_reconcile,
     serialize_snapshot,
     serialize_snapshot_row,
@@ -531,6 +536,55 @@ def evaluate_delivery_request(payload: DeliveryEvaluateIn):
         blocked_pipe_ids=blocked_pipe_ids,
     )
     return serialize_delivery(version, payload.version, result)
+
+
+@app.post(
+    "/api/delivery/priority",
+    response_model=DeliveryPriorityOut,
+    tags=["流量核算"],
+    summary="按保障等级核算各用水点可获流量：先等级总量、再逐点词典序最大（只读）",
+)
+def evaluate_priority_request(payload: DeliveryPriorityIn):
+    with db.get_conn() as conn:
+        version, _updated_at, nodes, pipes = db.load_snapshot(conn)
+        # 已关闭阀门与待修复故障管段不可通行：阻断口径与既有可达性接口完全一致
+        pending_fault_ids = frozenset(
+            e["fault_pipe_id"] for e in db.list_open_events(conn)
+        )
+
+    source_caps = [(s.source_id, s.capacity) for s in payload.sources]
+    pipe_caps = [(p.pipe_id, p.capacity) for p in payload.pipes]
+    demands = [(d.sink_id, d.demand, d.level) for d in payload.demands]
+
+    # 编号/覆盖/重复/类型校验与流量核算同一套规则（等级合法性由请求模型保证）
+    issues = validate_delivery_request(
+        nodes,
+        pipes,
+        source_caps,
+        pipe_caps,
+        [(sink_id, demand) for sink_id, demand, _level in demands],
+    )
+    if issues:
+        raise ApiError(
+            422,
+            "DELIVERY_PRIORITY_INVALID",
+            "等级保障核算请求非法（编号未覆盖当前管网、同类重复、用水点不存在或需求列表为空）",
+            issues=issues,
+        )
+
+    blocked_pipe_ids = frozenset(
+        p.id for p in pipes.values() if p.has_valve and p.valve_closed
+    ) | pending_fault_ids
+
+    result = evaluate_priority_delivery(
+        nodes,
+        pipes,
+        source_caps,
+        pipe_caps,
+        demands,
+        blocked_pipe_ids=blocked_pipe_ids,
+    )
+    return serialize_priority_delivery(version, payload.version, result)
 
 
 # ---------------------------------------------------------------- 读数核对（只读）
