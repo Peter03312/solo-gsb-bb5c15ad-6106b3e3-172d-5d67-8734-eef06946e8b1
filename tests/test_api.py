@@ -1797,6 +1797,273 @@ class DeliveryApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/isolation/events").json(), [])
 
 
+# 保障等级分档交付请求样例（基于 VALID_NETWORK）
+def _allocate_body(
+    version=1,
+    *,
+    source_cap=100,
+    pipe_caps=None,
+    demands=None,
+):
+    return {
+        "version": version,
+        "sources": [{"source_id": "S", "capacity": source_cap}],
+        "pipes": [
+            {"pipe_id": pid, "capacity": cap}
+            for pid, cap in (
+                pipe_caps
+                or [("P1", 100), ("P2", 100), ("P3", 100),
+                    ("P4", 100), ("P5", 100), ("P6", 100)]
+            )
+        ],
+        "demands": [
+            {"sink_id": sid, "demand": d, "level": lvl}
+            for sid, d, lvl in (
+                demands
+                or [("U1", 1, 1), ("U2", 1, 2), ("U3", 1, 2)]
+            )
+        ],
+    }
+
+
+class DeliveryAllocateApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        STORE.version = 0
+        STORE.nodes = {}
+        STORE.pipes = {}
+        STORE.events = []
+        STORE.next_event_id = 1
+        STORE.snapshots = []
+        STORE.next_snapshot_id = 1
+        STORE.fail_commit = False
+
+    def _import(self, network=VALID_NETWORK):
+        r = self.client.post("/api/network/import", json=network)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def test_priority_level_lexicographic_allocation(self):
+        self._import()
+        # P3 是 A->U1 的唯一管段（容量 6）：U1 等级 1 先拿 6，
+        # 等级 2 的 U2/U3 共享其余能力并按编号逐点最大化
+        body = _allocate_body(
+            pipe_caps=[("P1", 100), ("P2", 100), ("P3", 6),
+                       ("P4", 100), ("P5", 100), ("P6", 100)],
+            demands=[("U1", 10, 1), ("U2", 10, 2), ("U3", 10, 2)],
+        )
+        r = self.client.post("/api/delivery/allocate", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["version"], 1)
+        self.assertTrue(out["version_match"])
+        self.assertEqual(out["total_demand"], 30)
+        # 等级 1 总量 6；等级 2 总量 20（U2/U3 各 10）；总交付 26
+        self.assertEqual(
+            [(l["level"], l["delivered"], l["demand"]) for l in out["levels"]],
+            [(1, 6, 10), (2, 20, 20)],
+        )
+        self.assertEqual(
+            [(d["sink_id"], d["level"], d["delivered"], d["shortfall"])
+             for d in out["deliveries"]],
+            [
+                ("U1", 1, 6, 4),
+                ("U2", 2, 10, 0),
+                ("U3", 2, 10, 0),
+            ],
+        )
+        self.assertFalse(out["all_satisfied"])
+        for item in out["deliveries"]:
+            self.assertEqual(item["satisfied"], item["delivered"] == item["demand"])
+
+    def test_abundant_capacity_all_satisfied(self):
+        self._import()
+        r = self.client.post("/api/delivery/allocate", json=_allocate_body())
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertTrue(out["all_satisfied"])
+        self.assertEqual(out["total_delivered"], 3)
+        self.assertTrue(all(d["delivered"] == 1 for d in out["deliveries"]))
+
+    def test_level_1_starves_before_level_2(self):
+        self._import()
+        # 水源只能供 1：给等级 1 的 U1，不给等级 2 的 U2/U3
+        body = _allocate_body(
+            source_cap=1,
+            demands=[("U1", 1, 1), ("U2", 1, 2), ("U3", 1, 2)],
+        )
+        out = self.client.post("/api/delivery/allocate", json=body).json()
+        self.assertEqual(
+            [(d["sink_id"], d["delivered"]) for d in out["deliveries"]],
+            [("U1", 1), ("U2", 0), ("U3", 0)],
+        )
+        self.assertEqual(
+            [(l["level"], l["delivered"]) for l in out["levels"]],
+            [(1, 1), (2, 0)],
+        )
+
+    def test_blocked_valve_and_open_fault_respected(self):
+        self._import()
+        # 隔离 P6 关 P4：U3 断供（故障管段 P6 + 已关阀门 P4）
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = _allocate_body(
+            version=2,
+            demands=[("U1", 1, 1), ("U2", 1, 1), ("U3", 1, 2)],
+        )
+        out = self.client.post("/api/delivery/allocate", json=body).json()
+        self.assertEqual(
+            [(d["sink_id"], d["delivered"]) for d in out["deliveries"]],
+            [("U1", 1), ("U2", 1), ("U3", 0)],
+        )
+        # 同等级 U1/U2 拿满；等级 2 的 U3 因阻断为 0
+        self.assertEqual(
+            [(l["level"], l["delivered"], l["shortfall"]) for l in out["levels"]],
+            [(1, 2, 0), (2, 0, 1)],
+        )
+
+    def test_stale_version_marked_mismatch_but_computed(self):
+        self._import()
+        body = _allocate_body(version=99)
+        out = self.client.post("/api/delivery/allocate", json=body).json()
+        self.assertEqual(out["version"], 1)
+        self.assertFalse(out["version_match"])
+        self.assertTrue(out["all_satisfied"])
+
+    def test_zero_demand_point_listed_allowed(self):
+        self._import()
+        body = _allocate_body(demands=[("U1", 0, 1)])
+        out = self.client.post("/api/delivery/allocate", json=body).json()
+        self.assertEqual(out["total_demand"], 0)
+        self.assertEqual(out["total_delivered"], 0)
+        self.assertTrue(out["all_satisfied"])
+        self.assertEqual(out["deliveries"][0]["delivered"], 0)
+
+    def test_unlisted_sinks_not_consumed(self):
+        self._import()
+        body = _allocate_body(demands=[("U3", 5, 1)])
+        out = self.client.post("/api/delivery/allocate", json=body).json()
+        self.assertEqual(out["total_demand"], 5)
+        self.assertEqual(out["total_delivered"], 5)
+        self.assertTrue(out["all_satisfied"])
+        self.assertEqual([d["sink_id"] for d in out["deliveries"]], ["U3"])
+
+    def test_invalid_level_values_rejected(self):
+        self._import()
+
+        def post_raw(raw):
+            return self.client.post(
+                "/api/delivery/allocate",
+                content=json.dumps(raw),
+                headers={"Content-Type": "application/json"},
+            )
+
+        for bad_level in (0, -1, 1.5, True, "1"):
+            body = _allocate_body()
+            bad = json.loads(json.dumps(body))
+            bad["demands"][0]["level"] = bad_level
+            r = post_raw(bad)
+            self.assertEqual(r.status_code, 422, (bad_level, r.text))
+
+    def test_coverage_duplicate_type_errors_rejected(self):
+        self._import()
+        body = _allocate_body()
+        # 水源未覆盖 + 管段重复 + 用水点不是 sink / 不存在 / 重复
+        body["sources"] = []
+        body["pipes"].append({"pipe_id": "P1", "capacity": 1})
+        body["demands"].extend(
+            [
+                {"sink_id": "U1", "demand": 1, "level": 1},
+                {"sink_id": "S", "demand": 1, "level": 1},
+                {"sink_id": "UX", "demand": 1, "level": 1},
+            ]
+        )
+        r = self.client.post("/api/delivery/allocate", json=body)
+        self.assertEqual(r.status_code, 422)
+        err = r.json()["error"]
+        self.assertEqual(err["code"], "DELIVERY_REQUEST_INVALID")
+        codes = {i["code"] for i in err["issues"]}
+        self.assertIn("DELIVERY_SOURCE_MISSING", codes)
+        self.assertIn("DELIVERY_PIPE_DUPLICATE", codes)
+        self.assertIn("DELIVERY_SINK_DUPLICATE", codes)
+        self.assertIn("DELIVERY_SINK_NOT_SINK", codes)
+        self.assertIn("DELIVERY_SINK_NOT_FOUND", codes)
+
+    def test_empty_demands_rejected(self):
+        self._import()
+        body = _allocate_body()
+        body["demands"] = []
+        r = self.client.post("/api/delivery/allocate", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(
+            r.json()["error"]["issues"][0]["code"], "DELIVERY_DEMANDS_EMPTY"
+        )
+
+    def test_extra_field_and_non_integer_values_rejected(self):
+        self._import()
+
+        def post_raw(raw):
+            return self.client.post(
+                "/api/delivery/allocate",
+                content=json.dumps(raw),
+                headers={"Content-Type": "application/json"},
+            )
+
+        base = _allocate_body()
+        bad = json.loads(json.dumps(base))
+        bad["demands"][0]["extra"] = 1
+        self.assertEqual(post_raw(bad).status_code, 422)
+        bad = json.loads(json.dumps(base))
+        bad["sources"][0]["capacity"] = -3
+        self.assertEqual(post_raw(bad).status_code, 422)
+        bad = json.loads(json.dumps(base))
+        bad["pipes"][0]["capacity"] = 2.5
+        self.assertEqual(post_raw(bad).status_code, 422)
+
+    def test_read_only_no_state_change(self):
+        info = self._import()
+        self.client.post("/api/delivery/allocate", json=_allocate_body())
+        self.client.post("/api/delivery/allocate", json=_allocate_body(version=99))
+        bad = _allocate_body()
+        bad["sources"] = []
+        self.client.post("/api/delivery/allocate", json=bad)
+        net = self.client.get("/api/network").json()
+        self.assertEqual(net["version"], 1)
+        snaps = self.client.get("/api/snapshots").json()
+        self.assertEqual([s["id"] for s in snaps], [info["snapshot_id"]])
+        self.assertEqual(self.client.get("/api/isolation/events").json(), [])
+
+    def test_existing_evaluate_endpoint_unchanged(self):
+        # 现有 /api/delivery/evaluate 的输入输出保持不变（无 level 字段）
+        self._import()
+        body = {
+            "version": 1,
+            "sources": [{"source_id": "S", "capacity": 100}],
+            "pipes": [
+                {"pipe_id": pid, "capacity": 100}
+                for pid in ("P1", "P2", "P3", "P4", "P5", "P6")
+            ],
+            "demands": [
+                {"sink_id": "U1", "demand": 1},
+                {"sink_id": "U2", "demand": 1},
+                {"sink_id": "U3", "demand": 1},
+            ],
+        }
+        r = self.client.post("/api/delivery/evaluate", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(
+            set(r.json().keys()),
+            {"version", "version_match", "total_demand",
+             "max_delivered_total", "feasible"},
+        )
+
+
 def _reconcile_body(
     version=1,
     *,

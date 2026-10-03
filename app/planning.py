@@ -42,6 +42,18 @@
   按无向边容量建模；最大可交付总量 = 超级源→各水源→管网→各需求点→超级汇
   的整数最大流（对总需求封顶）。全部为整数容量，最大流为整数。
 
+保障等级分档交付（delivery allocate）规则（只读，语义独立于上述总量核算）：
+- 每个申报用水点除非负整数需求外还带**正整数保障等级**（数字越小越优先），
+  未列用水点按零需求、不参与分配；编号/覆盖/重复/类型校验与总量核算完全一致。
+- 优化目标（字典序）：先按等级从小到大依次最大化该等级交付总量，
+  再在各等级总量均为最优的条件下，按（等级, 用水点编号字典序）逐点最大化
+  交付量；各点交付不得超过需求；最终各点交付由**一组同时可行的整数流量**实现。
+- 实现用“有下界整数环流 + 残量环流补偿增广”：超级源汇以返回弧闭合为环流，
+  阶段 A 逐级把已定等级汇边锁定为 low=high 后最大化本级汇边（更高等级暂不
+  入网，避免被未来流量挤占）；阶段 B 锁定全部等级总量并逐点锁定已最优汇水
+  弧，在残量网上做弧终点→起点的最大补偿增广；锁定弧不开放反向残量，已锁定
+  的更优目标不可能被后续增广挤占（与读数核对缺报范围同一项残量环流技术）。
+
 读数核对（meter reconcile）规则（只读，不改阀位/事件/版本/快照）：
 - 调度员携带已读版本、每个水源的实际注入量、每个用水点的实际取用量、每条管段的
   双向共用容量与可为 null 的带符号读数（以管段 from→to 为正，升/小时），核对
@@ -1049,6 +1061,275 @@ def evaluate_delivery(
         total_demand=total_demand,
         max_delivered_total=max_delivered,
         feasible=max_delivered == total_demand,
+    )
+
+
+# ---------------------------------------------------- 保障等级分档交付
+
+
+@dataclass
+class SinkAllocation:
+    """单个用水点的分档交付结果（只读计算）。"""
+
+    sink_id: str
+    level: int
+    demand: int
+    delivered: int
+
+    @property
+    def shortfall(self) -> int:
+        return self.demand - self.delivered
+
+
+@dataclass
+class LevelAllocation:
+    """单个保障等级的交付汇总（按等级数值升序返回）。"""
+
+    level: int
+    demand: int
+    delivered: int
+    shortfall: int
+    all_satisfied: bool
+
+
+@dataclass
+class AllocationResult:
+    """保障等级分档交付结果（只读计算，不改任何状态）。
+
+    - entries：按（等级升序、用水点编号字典序）排列的各点交付；
+    - levels：按等级数值升序排列的分档汇总；
+    - 先按等级依次最大化该等级交付总量，再在各等级总量最优条件下按
+      （等级, 用水点编号）逐点最大化交付；delivered 由一组同时可行的整数流量实现。
+    """
+
+    total_demand: int
+    total_delivered: int
+    all_satisfied: bool
+    entries: list[SinkAllocation] = field(default_factory=list)
+    levels: list[LevelAllocation] = field(default_factory=list)
+    issues: list[Issue] = field(default_factory=list)
+
+
+def _lex_bounded_circulation(
+    n: int,
+    arcs: list[tuple[int, int, int, int]],
+):
+    """有下界整数环流可行性（约定同 _bounded_feasible_flow，外部供给恒为 0）。
+
+    arcs：(u, v, low, high)。对每条弧先强制流下界 low：b(u)-=low、b(v)+=low；
+    b(n)>0（净需入）加 SS->n，b(n)<0（净需出）加 n->TT；SS->TT 最大流全部
+    饱和即存在可行环流。返回 (是否可行, refs)，refs 每条为
+    [u, v, low, high, 正向边索引, 总流量]，供残量补偿增广复用。
+    """
+    ss = n
+    tt = n + 1
+    dinic = _Dinic(n + 2)
+    refs: list[list] = []
+    b = [0] * n
+    for u, v, low, high in arcs:
+        idx = dinic.add_arc(u, v, high - low)
+        refs.append([u, v, low, high, idx])
+        b[u] -= low
+        b[v] += low
+    required = 0
+    for node, balance in enumerate(b):
+        if balance > 0:
+            dinic.add_arc(ss, node, balance)
+            required += balance
+        elif balance < 0:
+            dinic.add_arc(node, tt, -balance)
+    if dinic.max_flow(ss, tt) != required:
+        return False, []
+    for ref in refs:
+        u, _v, low, _high, idx = ref
+        ref.append(low + dinic.graph[u][idx][4])
+    return True, refs
+
+
+def _lex_residual_circulation_delta(
+    n: int,
+    refs: list[list],
+    target: tuple[int, int],
+) -> int:
+    """残量环流补偿：目标弧 u->v 在不回撤任何锁定弧前提下还能再增多少。
+
+    剔除目标弧自身（正反向均剔除）后，在残量网上做 v->u 最大流（与
+    reconcile_meters 缺报范围同一原理）。每条**自由弧**（low<high）贡献
+    正向余量 high-f 与反向回撤 f 两条独立残量弧；**锁定弧（low=high）只
+    保留正向余量、不开放反向回撤**，否则补偿环流会沿其反向残量抽走已锁定
+    的更低等级总量/逐点交付，违背字典序约束。
+    """
+    tu, tv = target
+    residual = _Dinic(n)
+    for u, v, low, high, _idx, f in refs:
+        if (u, v) == (tu, tv):
+            continue  # 目标弧自身：正向余量与反向回撤都剔除
+        locked = low >= high
+        if high - f > 0:
+            residual.add_arc(u, v, high - f)
+        if not locked and f > 0:
+            residual.add_arc(v, u, f)
+    return residual.max_flow(tv, tu)
+
+
+def allocate_delivery(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    source_caps: list[tuple[str, int]],
+    pipe_caps: list[tuple[str, int]],
+    demands: list[tuple[str, int, int]],
+    *,
+    blocked_pipe_ids: frozenset[str] = frozenset(),
+) -> AllocationResult:
+    """按保障等级分档核算各用水点可获得的交付流量（只读）。
+
+    demands：(用水点编号, 非负整数需求, 正整数等级)，等级数字越小越优先。
+    blocked_pipe_ids：已关闭阀门与待修复故障管段，容量按 0（与可达性口径一致）。
+    停运水源(running=False)不供水（容量按 0）。调用方须先通过
+    validate_delivery_request（demands 取 (sink_id, demand)）结构校验。
+
+    优化序：先按等级从小到大依次最大化该等级交付总量，再在各等级总量均为
+    最优的条件下，按（等级, 用水点编号字典序）逐点最大化交付；各点交付不
+    超过需求；每一步以有下界整数环流 + 残量环流补偿增广推进，锁定量以
+    low=high 固定弧保住，最终各点交付由一组同时可行的整数流量实现。
+
+    环流网络：超级源 SRC -> 运行水源（[0, 供水上限]）-> 无向管段网（两条
+    独立 [0,c] 有向弧，双向共用同总量核算口径）-> 用水点（[low, 需求]）
+    -> 等级收集器 C_l -> 超级汇 SNK（等级弧 [low, high]），并以返回弧
+    SNK->SRC（[0, 总需求]）闭合为环流。残量补偿沿“目标弧终点 -> 起点”
+    推动一整圈环流（经返回弧闭合）来增加目标弧流量，故不会产生脱离管网的
+    人工流量；锁定弧（low=high）不开放反向残量，已锁定等级总量/逐点交付
+    不可能被补偿增广挤占。
+
+    - 阶段 A 处理等级 l 时只让 <=l 的等级入网：更低等级总量弧锁定为
+      [总量, 总量]，更高等级用水点不入网（在已锁定更低等级总量下，本级
+      可达最大值与全网一致——未来用水点不消耗即可得到同一流量）；
+    - 阶段 B 全部等级总量弧锁定为 [总量, 总量]，已逐点锁定的用水点汇水弧
+      也锁定为 [交付, 交付]；同等级未锁定点的残量回撤天然实现“本级总量
+      不变下把水让给优先点”。
+    """
+    # (sink_id, demand, level)，排序键：等级升序 -> 用水点编号字典序
+    ordered = sorted(demands, key=lambda t: (t[2], t[0]))
+    total_demand = sum(d for _sid, d, _lvl in ordered)
+    levels_present = sorted({lvl for _sid, _d, lvl in ordered})
+
+    source_cap_map = dict(source_caps)
+    running_sources = [
+        (nid, source_cap_map[nid])
+        for nid, node in nodes.items()
+        if node.type == "source" and node.running and source_cap_map.get(nid, 0) > 0
+    ]
+    pipe_cap_map = dict(pipe_caps)
+
+    node_ids = list(nodes.keys())
+    index = {nid: i for i, nid in enumerate(node_ids)}
+    src = len(node_ids)
+    collector_base = src + 1
+    collector = {lvl: collector_base + i for i, lvl in enumerate(levels_present)}
+    snk = collector_base + len(levels_present)
+    n_nodes = snk + 1
+
+    level_demand: dict[int, int] = {}
+    for _sid, d, lvl in ordered:
+        level_demand[lvl] = level_demand.get(lvl, 0) + d
+    demand_of = {sid: d for sid, d, _lvl in ordered}
+
+    def solve_step(
+        active_levels: set[int],
+        locked_levels: dict[int, int],
+        locked_sinks: dict[str, int],
+        target: tuple[int, int, int],
+    ) -> int:
+        """构建一次有下界环流，返回目标弧 (u,v,上界) 的最大可达流量。"""
+        tu, tv, thigh = target
+        arcs: list[tuple[int, int, int, int]] = [(snk, src, 0, total_demand)]
+        for nid, cap in running_sources:
+            arcs.append((src, index[nid], 0, cap))
+        for p in pipes.values():
+            cap = 0 if p.id in blocked_pipe_ids else pipe_cap_map[p.id]
+            if cap > 0:
+                arcs.append((index[p.from_node], index[p.to_node], 0, cap))
+                arcs.append((index[p.to_node], index[p.from_node], 0, cap))
+        for sid, d, lvl in ordered:
+            if lvl not in active_levels:
+                continue  # 阶段 A：更高等级用水点不入网、不消耗
+            locked = locked_sinks.get(sid, 0)
+            if locked:
+                arcs.append((index[sid], collector[lvl], locked, locked))
+            else:
+                arcs.append((index[sid], collector[lvl], 0, d))
+        for lvl, c in collector.items():
+            if lvl not in active_levels:
+                continue
+            total = locked_levels.get(lvl, 0)
+            if total:
+                arcs.append((c, snk, total, total))  # 锁定弧 low=high
+            else:
+                arcs.append((c, snk, 0, level_demand[lvl]))
+
+        feasible, refs = _lex_bounded_circulation(n_nodes, arcs)
+        # 锁定值都是此前各步在更松约束下取得的可达值，归纳保证可行
+        assert feasible, "保障等级分档：锁定约束下应始终存在可行环流"
+        current = next(ref[5] for ref in refs if ref[0] == tu and ref[1] == tv)
+        gain = _lex_residual_circulation_delta(n_nodes, refs, (tu, tv))
+        return min(thigh, current + gain)
+
+    # 阶段 A：按等级升序依次最大化该等级交付总量（更高等级暂不入网）
+    level_totals: dict[int, int] = {}
+    active: set[int] = set()
+    for lvl in levels_present:
+        active.add(lvl)
+        level_totals[lvl] = solve_step(
+            active,
+            dict(level_totals),
+            {},
+            (collector[lvl], snk, level_demand[lvl]),
+        )
+
+    # 阶段 B：各等级总量固定为最优，按（等级, 编号）逐点最大化交付。
+    # 目标弧为用水点 -> 其等级收集器，补偿增广沿收集器 -> 用水点推动环流。
+    locked_sinks: dict[str, int] = {}
+    all_levels = set(levels_present)
+    for sid, _d, _lvl in ordered:
+        locked_sinks[sid] = solve_step(
+            all_levels,
+            dict(level_totals),
+            dict(locked_sinks),
+            (index[sid], collector[_lvl], demand_of[sid]),
+        )
+
+    demand_map = {sid: (d, lvl) for sid, d, lvl in ordered}
+    entries = [
+        SinkAllocation(
+            sink_id=sid,
+            level=demand_map[sid][1],
+            demand=demand_map[sid][0],
+            delivered=locked_sinks[sid],
+        )
+        for sid, _d, _lvl in ordered
+    ]
+    level_summaries: list[LevelAllocation] = []
+    for lvl in levels_present:
+        members = [e for e in entries if e.level == lvl]
+        d_sum = sum(e.demand for e in members)
+        delivered_sum = sum(e.delivered for e in members)
+        level_summaries.append(
+            LevelAllocation(
+                level=lvl,
+                demand=d_sum,
+                delivered=delivered_sum,
+                shortfall=d_sum - delivered_sum,
+                all_satisfied=delivered_sum == d_sum,
+            )
+        )
+
+    total_delivered = sum(e.delivered for e in entries)
+    return AllocationResult(
+        total_demand=total_demand,
+        total_delivered=total_delivered,
+        all_satisfied=total_delivered == total_demand,
+        entries=entries,
+        levels=level_summaries,
     )
 
 

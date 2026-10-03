@@ -124,6 +124,39 @@ class DeliveryEvaluateIn(BaseModel):
     )
 
 
+class DeliveryAllocationDemandIn(BaseModel):
+    """保障等级分档交付中的单个用水点需求（未列出的用水点按零需求、不参与分配）。"""
+
+    sink_id: str = Field(min_length=1, description="用水点节点编号")
+    demand: StrictInt = Field(ge=0, description="需求流量（非负整数，升/小时；交付不超过需求）")
+    # 保障等级：正整数，数字越小越优先（StrictInt 拒绝布尔/小数）
+    level: StrictInt = Field(ge=1, description="保障等级（正整数，数字越小越优先）")
+
+    model_config = {"extra": "forbid"}
+
+
+class DeliveryAllocateIn(BaseModel):
+    """保障等级分档交付入参。
+
+    水源与管段编号须完整覆盖当前管网（不多不少、同类不重复）；
+    用水点编号须存在且为 sink、同批不重复；需求列表非空；
+    等级为正整数，数字越小越优先。先按等级依次最大化该等级交付总量，
+    再在各等级总量最优条件下按（等级, 用水点编号）逐点最大化交付。
+    """
+
+    version: StrictInt = Field(ge=0, description="读取管网时的版本号，空网为 0")
+    sources: list[DeliverySourceIn] = Field(
+        description="每个水源的供水上限（须覆盖当前管网全部水源；空网为空列表）"
+    )
+    pipes: list[DeliveryPipeIn] = Field(
+        description="每条管段的双向共用输水上限（须覆盖全部管段；空网为空列表）"
+    )
+    demands: list[DeliveryAllocationDemandIn] = Field(
+        description="非空用水点需求列表（sink_id/demand/level）；"
+        "未列需求的用水点按零需求、不参与分配"
+    )
+
+
 # ---------------------------------------------------------------- 响应模型
 
 
@@ -271,6 +304,44 @@ class DeliveryEvaluateOut(BaseModel):
     total_demand: int
     max_delivered_total: int
     feasible: bool
+
+
+class SinkDeliveryOut(BaseModel):
+    """单个用水点的分档交付：需求、实际交付与缺口。"""
+
+    sink_id: str
+    level: int
+    demand: int
+    delivered: int
+    shortfall: int
+    satisfied: bool
+
+
+class LevelDeliveryOut(BaseModel):
+    """单个保障等级的交付汇总（按等级数值升序）。"""
+
+    level: int
+    demand: int
+    delivered: int
+    shortfall: int
+    all_satisfied: bool
+
+
+class DeliveryAllocateOut(BaseModel):
+    """保障等级分档交付只读结果。
+
+    先按等级依次最大化该等级交付总量，再在各等级总量最优条件下按
+    （等级, 用水点编号）逐点最大化交付；deliveries 按该顺序排列，
+    各点交付由一组同时可行的整数流量实现。
+    """
+
+    version: int
+    version_match: bool
+    total_demand: int
+    total_delivered: int
+    all_satisfied: bool
+    levels: list[LevelDeliveryOut]
+    deliveries: list[SinkDeliveryOut]
 
 
 class ReconcileSourceIn(BaseModel):

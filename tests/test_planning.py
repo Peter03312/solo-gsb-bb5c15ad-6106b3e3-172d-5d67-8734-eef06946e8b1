@@ -12,6 +12,7 @@ from app.planning import (  # noqa: E402
     Node,
     Pipe,
     diff_states,
+    allocate_delivery,
     evaluate_delivery,
     evaluate_plan,
     evaluate_restore,
@@ -1011,6 +1012,189 @@ class DeliveryMaxFlowTests(unittest.TestCase):
             [("U1", 100), ("U2", 100)],
         )
         self.assertEqual(flow, 5)
+
+
+# ------------------------------------------------------------ 保障等级分档交付
+
+
+def build_allocation_demo():
+    """S --P1-- A --P2-- U1；A --P3-- U2（便于按等级/逐点核对字典序）。"""
+    nodes = {
+        "S": Node("S", "source"),
+        "A": Node("A", "junction"),
+        "U1": Node("U1", "sink"),
+        "U2": Node("U2", "sink"),
+    }
+    pipes = {
+        "P1": Pipe("P1", "S", "A"),
+        "P2": Pipe("P2", "A", "U1"),
+        "P3": Pipe("P3", "A", "U2"),
+    }
+    return nodes, pipes
+
+
+class DeliveryAllocationTests(unittest.TestCase):
+    def _entries(self, result):
+        return [(e.sink_id, e.level, e.delivered, e.demand) for e in result.entries]
+
+    def test_higher_level_starves_first_under_shared_bottleneck(self):
+        nodes, pipes = build_allocation_demo()
+        # P1 双向共用只有 10：等级 1 的 U1 先拿满 10，等级 2 的 U2 得 0
+        result = allocate_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 10), ("P2", 100), ("P3", 100)],
+            [("U1", 10, 1), ("U2", 10, 2)],
+        )
+        self.assertEqual(
+            self._entries(result),
+            [("U1", 1, 10, 10), ("U2", 2, 0, 10)],
+        )
+        self.assertEqual(result.total_delivered, 10)
+        self.assertFalse(result.all_satisfied)
+        self.assertEqual(
+            [(l.level, l.delivered, l.demand, l.shortfall) for l in result.levels],
+            [(1, 10, 10, 0), (2, 0, 10, 10)],
+        )
+
+    def test_level_order_comes_before_sink_id_order(self):
+        nodes, pipes = build_allocation_demo()
+        # U2 等级 1、U1 等级 2：编号靠后的 U2 反而先拿满
+        result = allocate_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 10), ("P2", 100), ("P3", 100)],
+            [("U1", 10, 2), ("U2", 10, 1)],
+        )
+        self.assertEqual(
+            self._entries(result),
+            [("U2", 1, 10, 10), ("U1", 2, 0, 10)],
+        )
+
+    def test_within_level_sink_id_lexicographic_tie_break(self):
+        nodes, pipes = build_allocation_demo()
+        # 同等级、共享瓶颈 10、各要 10：编号小的 U1 先满
+        result = allocate_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 10), ("P2", 100), ("P3", 100)],
+            [("U1", 10, 1), ("U2", 10, 1)],
+        )
+        self.assertEqual(
+            self._entries(result),
+            [("U1", 1, 10, 10), ("U2", 1, 0, 10)],
+        )
+        self.assertEqual(result.levels[0].delivered, 10)
+
+    def test_within_level_total_kept_while_sharing_scarce_pipe(self):
+        nodes, pipes = build_allocation_demo()
+        # P2（A->U1）只能 6：等级总量受 P1=10 上限为 10；逐点阶段先保 U1=6，
+        # 再在“等级总量 10 不变”下把剩余 4 给 U2
+        result = allocate_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 10), ("P2", 6), ("P3", 100)],
+            [("U1", 10, 1), ("U2", 10, 1)],
+        )
+        self.assertEqual(
+            self._entries(result),
+            [("U1", 1, 6, 10), ("U2", 1, 4, 10)],
+        )
+        self.assertTrue(result.levels[0].all_satisfied is False)
+        self.assertEqual(result.levels[0].delivered, 10)
+
+    def test_source_capacity_bounds_priority_levels(self):
+        nodes, pipes = build_allocation_demo()
+        # 水源只能供 7：等级 1 的 U1 先满足 5，余量 2 给等级 2 的 U2
+        result = allocate_delivery(
+            nodes, pipes,
+            [("S", 7)],
+            [("P1", 100), ("P2", 100), ("P3", 100)],
+            [("U1", 5, 1), ("U2", 5, 2)],
+        )
+        self.assertEqual(
+            self._entries(result),
+            [("U1", 1, 5, 5), ("U2", 2, 2, 5)],
+        )
+
+    def test_all_satisfied_when_capacity_abundant(self):
+        nodes, pipes = build_allocation_demo()
+        result = allocate_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 100), ("P2", 100), ("P3", 100)],
+            [("U1", 3, 1), ("U2", 4, 2)],
+        )
+        self.assertEqual(
+            self._entries(result),
+            [("U1", 1, 3, 3), ("U2", 2, 4, 4)],
+        )
+        self.assertTrue(result.all_satisfied)
+        self.assertTrue(all(l.all_satisfied for l in result.levels))
+
+    def test_zero_demand_points_get_zero_and_skipped_levels(self):
+        nodes, pipes = build_allocation_demo()
+        result = allocate_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 100), ("P2", 100), ("P3", 100)],
+            [("U1", 0, 1), ("U2", 0, 2)],
+        )
+        self.assertEqual(result.total_demand, 0)
+        self.assertEqual(result.total_delivered, 0)
+        self.assertTrue(result.all_satisfied)
+        self.assertEqual(
+            self._entries(result),
+            [("U1", 1, 0, 0), ("U2", 2, 0, 0)],
+        )
+        # 等级允许跳跃（1 与 3）
+        result = allocate_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 10), ("P2", 100), ("P3", 100)],
+            [("U1", 10, 3), ("U2", 10, 1)],
+        )
+        self.assertEqual([l.level for l in result.levels], [1, 3])
+        self.assertEqual(
+            self._entries(result),
+            [("U2", 1, 10, 10), ("U1", 3, 0, 10)],
+        )
+
+    def test_blocked_pipes_and_stopped_source_deliver_zero(self):
+        nodes, pipes = build_allocation_demo()
+        # P1 阻断：整个下游断供
+        result = allocate_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 100), ("P2", 100), ("P3", 100)],
+            [("U1", 5, 1), ("U2", 5, 1)],
+            blocked_pipe_ids=frozenset({"P1"}),
+        )
+        self.assertEqual(result.total_delivered, 0)
+        self.assertFalse(result.all_satisfied)
+
+        nodes["S"] = Node("S", "source", running=False)
+        result = allocate_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 100), ("P2", 100), ("P3", 100)],
+            [("U1", 5, 1), ("U2", 5, 1)],
+        )
+        self.assertEqual(result.total_delivered, 0)
+
+    def test_entries_sorted_by_level_then_sink_id(self):
+        nodes, pipes = build_allocation_demo()
+        # 请求顺序故意打乱；响应恒按（等级, 编号）排序
+        result = allocate_delivery(
+            nodes, pipes,
+            [("S", 100)],
+            [("P1", 100), ("P2", 100), ("P3", 100)],
+            [("U2", 4, 2), ("U1", 3, 1)],
+        )
+        self.assertEqual(
+            [(e.sink_id, e.level) for e in result.entries],
+            [("U1", 1), ("U2", 2)],
+        )
 
 
 # ---------------------------------------------------------------- 读数核对

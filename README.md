@@ -13,10 +13,13 @@
 不可复用编号的**操作后状态快照**，供调度员按操作顺序回看当时的节点、水源运行状态、
 管段阀位、待修复故障与由运行水源可达的用水点，并支持相邻快照六类净变化对照。
 调度员还可在**现有阀位与故障状态**下携带各水源供水上限、各管段双向共用输水上限与
-用水点最低需求，**只读核算**管网能否满足这组用水点的最低流量（整数最大流）。
+用水点最低需求，**只读核算**管网能否满足这组用水点的最低流量（整数最大流）；
+供水不足时还可携带各用水点的**保障等级**（数字越小越优先），**只读核算分档交付**：
+先按等级依次最大化该等级交付总量，再在各等级总量最优条件下按（等级、用水点编号）
+逐点最大化交付量，返回各点交付与缺口，结果由一组同时可行的整数流量实现。
 
-> 全部通水计算（读网、关阀建议、隔离预演/提交、复供预演/确认、水源切换预演、流量核算）
-> 只以**运行中**的水源为供水起点；停运水源不再供水。
+> 全部通水计算（读网、关阀建议、隔离预演/提交、复供预演/确认、水源切换预演、
+> 流量核算、分档交付）只以**运行中**的水源为供水起点；停运水源不再供水。
 
 ---
 
@@ -173,6 +176,33 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   （`feasible = max_delivered_total == total_demand`）；
   过期版本**不拒绝**：仍按当前状态核算，仅 `version_match=false`（与预演类接口一致）。
 
+**保障等级分档交付**（`POST /api/delivery/allocate`，**只读**，不改阀位/事件/版本/快照；
+与现有 `/api/delivery/evaluate` 并存、互不影响）：
+
+- 供水不足时调度员按**保障等级**核算各用水点可获得的流量（单位均为升/小时）：
+  每个申报用水点给非负整数 `demand` 与**正整数** `level`，**数字越小越优先**；
+  未列用水点按零需求、不参与分配。
+- 入参的版本、水源容量、管段容量及编号覆盖/重复/未知/用水点类型/非负整数等校验规则
+  与 `/api/delivery/evaluate` **完全一致**（同一套 `DELIVERY_*` 问题代码，非法整体
+  拒绝 `422 DELIVERY_REQUEST_INVALID` 并返回全部问题明细）；`demands` 仍须非空。
+  额外约束：`level` 必须为正整数（`0`、负数、小数、布尔等均按 422 拒绝）。
+- 通水口径与总量核算一致：沿用当前**运行水源**、**关阀**与**待修复(open)故障**
+  （停运水源容量按 0、阻断管段不可通行）；管段容量仍为**双向共用**（两方向净流量
+  合计不得超过上限）；各点交付不得超过其需求。
+- 优化目标（字典序，整数最大流）：
+  1. **先按等级从小到大依次最大化该等级交付总量**——低等级总量未达最优前，
+     高等级不占用可支撑低等级的输水能力；
+  2. **再在各等级总量均为最优的条件下，按（等级, 用水点编号字符串字典序）
+     逐点最大化交付量**——同等级总量内优先把编号靠前的用水点灌满；
+  3. 最终各点交付由**一组同时可行的整数流量**实现（内部以有下界整数环流 +
+     残量环流补偿增广逐级锁定，锁定目标以 `low=high` 固定，后续增广不可回撤）。
+- 返回当前版本 `version`、`version_match`、`total_demand`、`total_delivered`、
+  `all_satisfied`（总交付 == 总需求）、按等级数值升序的 `levels`
+  （每级 `level/demand/delivered/shortfall/all_satisfied`）以及按
+  （等级, 用水点编号）排序的 `deliveries`
+  （每点 `sink_id/level/demand/delivered/shortfall/satisfied`）。
+- 过期版本**不拒绝**：仍按当前状态核算，仅 `version_match=false`。
+
 **读数核对**（`POST /api/meters/reconcile`，**只读**，不改阀位/水源状态/事件/版本/快照）：
 
 - 调度员核对一批管段流量计读数，并在表计**缺报**时判断其可推断范围。入参为已读
@@ -245,6 +275,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | POST | `/api/sources/switch/preview` | 水源停运/恢复预演（只读：失供/恢复用水点、待修复故障重新进水风险） |
 | POST | `/api/sources/switch` | 水源停运/恢复确认（锁版本复核 + 原子更新水源状态） |
 | POST | `/api/delivery/evaluate` | 用水点最低流量核算（只读：现有阀位/故障下的最大可交付总量，整数最大流） |
+| POST | `/api/delivery/allocate` | 保障等级分档交付（只读：先按等级总量、再按等级/编号逐点最大化各点交付与缺口） |
 | POST | `/api/meters/reconcile` | 管段流量计读数核对（只读：一致性校验 + 缺报管段可行流量最小/最大值，整数有界可行流） |
 | GET | `/api/snapshots` | 状态快照列表（编号升序，`limit` / `after_id` 游标分页） |
 | GET | `/api/snapshots/{snapshot_id}` | 按编号读取冻结快照（节点/水源运行状态/管段阀位/待修复故障/可达用水点） |
@@ -848,7 +879,91 @@ python3 examples/delivery_demo.py http://localhost:8000
 水源上限不足 → 隔离关阀后故障片区断供 / 只申报可达用水点即可满足 →
 编号未覆盖/重复/类型错误的 422 拒绝 → 确认版本、阀位与事件全程未被改写。
 
-### 12. 管段流量计读数核对（只读，缺报推断）
+### 12. 保障等级分档交付（只读，供水不足时按等级核算）
+
+调度员在**现有阀位与故障状态**下，携带已读版本、覆盖全部水源/管段的非负整数
+容量，以及**非空**用水点需求（每点给非负整数需求 `demand` 与正整数保障等级
+`level`，数字越小越优先）。服务**只读**返回各用水点可获得的交付与缺口，
+不改任何状态：
+
+```bash
+curl -s -X POST http://localhost:8000/api/delivery/allocate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 1,
+    "sources": [{"source_id": "S", "capacity": 1000}],
+    "pipes": [
+      {"pipe_id": "P1", "capacity": 100},
+      {"pipe_id": "P2", "capacity": 100},
+      {"pipe_id": "P3", "capacity": 6},
+      {"pipe_id": "P4", "capacity": 100},
+      {"pipe_id": "P5", "capacity": 100},
+      {"pipe_id": "P6", "capacity": 100}
+    ],
+    "demands": [
+      {"sink_id": "U1", "demand": 10, "level": 1},
+      {"sink_id": "U2", "demand": 10, "level": 2},
+      {"sink_id": "U3", "demand": 10, "level": 2}
+    ]
+  }'
+```
+
+上例中 `U1`（等级 1）的唯一通道 `P3` 双向共用上限只有 6：服务先把等级 1
+总量最大化到 6（`U1=6`），再在等级 1 总量锁定的前提下最大化等级 2 总量
+（`U2=10`、`U3=10`），并在等级 2 总量 20 已最优下按编号逐点灌满：
+
+```json
+{
+  "version": 1,
+  "version_match": true,
+  "total_demand": 30,
+  "total_delivered": 26,
+  "all_satisfied": false,
+  "levels": [
+    {"level": 1, "demand": 10, "delivered": 6, "shortfall": 4, "all_satisfied": false},
+    {"level": 2, "demand": 20, "delivered": 20, "shortfall": 0, "all_satisfied": true}
+  ],
+  "deliveries": [
+    {"sink_id": "U1", "level": 1, "demand": 10, "delivered": 6, "shortfall": 4, "satisfied": false},
+    {"sink_id": "U2", "level": 2, "demand": 10, "delivered": 10, "shortfall": 0, "satisfied": true},
+    {"sink_id": "U3", "level": 2, "demand": 10, "delivered": 10, "shortfall": 0, "satisfied": true}
+  ]
+}
+```
+
+本轮用法要点：
+
+- **先保等级总量**：低等级（数字小）交付总量未达最优前，高等级不会占用可
+  支撑低等级的输水能力；再在各等级总量都最优的条件下，同等级内按
+  **用水点编号字符串字典序**逐点优先灌满编号靠前的点。
+- `deliveries` 恒按（等级升序、用水点编号升序）排列；各点 `delivered`
+  不超过 `demand`，`shortfall = demand - delivered`，`all_satisfied` 仅在
+  总交付等于总需求时为 true。上述各点交付由**一组同时可行的整数流量**实现。
+- 编号规则与 `/api/delivery/evaluate` 完全相同：`sources`/`pipes` 逐一覆盖
+  当前全部水源与管段（停运源、关阀/故障管段也仍须列出）；`demands` 只列本次
+  申报需求的用水点，未列点按零需求、不参与分配；编号缺失/重复/未知、用水点
+  类型错误、容量或需求为布尔/小数/负数、需求列表为空均
+  `422 DELIVERY_REQUEST_INVALID` 整体拒绝；`level` 还必须是**正整数**。
+- 通水口径沿用当前**运行水源、关阀与待修复故障**（停运源不供水、阻断管段
+  不可通行、管段双向共用容量），用过期版本（如 `"version": 99`）调用不报错，
+  仍按当前状态核算，仅 `version_match=false`。
+- 该接口为**只读新增**：现有 `/api/delivery/evaluate` 的输入输出与含义
+  **保持不变**（无 `level` 字段、仍只返回总量口径）。
+
+保障等级分档交付全流程演示脚本（标准库实现，全程只读）：
+
+```bash
+python3 examples/allocate_demo.py
+# 或指定地址：
+python3 examples/allocate_demo.py http://localhost:8000
+```
+
+脚本依次演示：容量充足全部满足 → P3 瓶颈下等级 1 的 U1 先保 6、等级 2 拿余量 →
+水源上限不足时等级优先 → 同等级按编号序逐点灌满 → 过期版本仍按当前状态核算 →
+隔离关阀后故障片区断供 → 等级非正整数 / 编号未覆盖 / 重复 / 类型错误的 422 拒绝 →
+确认版本、阀位与事件全程未被改写。
+
+### 13. 管段流量计读数核对（只读，缺报推断）
 
 调度员携带已读版本、每个水源的**实际注入量**、每个用水点的**实际取用量**、
 覆盖全部管段的**双向共用容量**与可为空的**带符号读数**（`from→to` 为正，升/小时），
@@ -961,13 +1076,13 @@ python3 examples/source_switch_demo.py http://localhost:8000
 
 ## 七、测试
 
-核心图算法与校验逻辑（`tests/test_planning.py`，81 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+核心图算法与校验逻辑（`tests/test_planning.py`，90 个用例）不依赖数据库与第三方库，可直接用标准库运行：
 
 ```bash
 python3 -m unittest tests.test_planning -v
 ```
 
-路由层集成测试（`tests/test_api.py`，79 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、读数核对（一致性/缺报范围/硬约束/422）、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
+路由层集成测试（`tests/test_api.py`，92 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -980,7 +1095,7 @@ python3 -m unittest discover -s tests -v
 app/
   config.py       # 环境变量配置
   schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、读数核对(校验+整数有界可行流+缺报流量范围)、状态快照冻结与相邻对照
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、保障等级分档交付(有下界整数环流+残量环流补偿的字典序最大流)、读数核对(校验+整数有界可行流+缺报流量范围)、状态快照冻结与相邻对照
   db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、状态快照写入/读取、旧库上线基线、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
@@ -993,6 +1108,7 @@ examples/
   recommend_demo.py       # 关阀建议全流程示例
   source_switch_demo.py   # 水源停运/恢复全流程示例
   delivery_demo.py        # 用水点最低流量核算全流程示例（只读：水源/管段上限、瓶颈、停运/关阀阻断）
+  allocate_demo.py        # 保障等级分档交付全流程示例（只读：等级总量优先、同等级编号序、缺口、阻断口径、422）
   meter_reconcile_demo.py # 管段流量计读数核对全流程示例（只读：一致性、缺报范围、停运/关阀/故障硬约束、422）
   snapshot_demo.py        # 状态快照回看全流程示例（四类操作冻结/读取/对照/不留痕/重导不覆盖）
 tests/
